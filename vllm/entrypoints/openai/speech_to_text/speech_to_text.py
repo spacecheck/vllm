@@ -253,6 +253,74 @@ class OpenAISpeechToText(OpenAIServing):
         model_cls = get_model_cls(self.model_config)
         return cast(type[SupportsTranscription], model_cls)
 
+    async def _detect_language(
+        self,
+        audio_chunk: np.ndarray,
+        request_id: str = "lang-detect",
+    ) -> str:
+        """Auto-detect the spoken language from an audio chunk.
+
+        Uses Whisper's native language detection: feed only
+        ``<|startoftranscript|>`` to the decoder and let the model predict
+        the most likely language token.  Falls back to ``"en"`` on any
+        failure.
+        """
+        if not hasattr(self.model_cls, "get_language_detection_prompt"):
+            # model handles language detection internally or doesn't support it, skip this step
+            return None
+
+        try:
+            from vllm.sampling_params import SamplingParams
+
+            prompt = self.model_cls.get_language_detection_prompt(
+                audio_chunk, self.asr_config,
+            )
+            sampling_params = SamplingParams(
+                max_tokens=1,
+                temperature=0.0,
+            )
+
+            result_generator = self.engine_client.generate(
+                prompt,
+                sampling_params,
+                request_id,
+            )
+
+            final_output: RequestOutput | None = None
+            async for output in result_generator:
+                final_output = output
+
+            if (final_output is None
+                    or not final_output.outputs
+                    or not final_output.outputs[0].token_ids):
+                logger.warning("Language detection produced no output, "
+                               "defaulting to 'en'")
+                return "en"
+
+            token_id = final_output.outputs[0].token_ids[0]
+            decoded = self.tokenizer.decode(
+                [token_id], skip_special_tokens=False,
+            )
+
+            # Expected format: "<|xx|>"
+            if decoded.startswith("<|") and decoded.endswith("|>"):
+                lang_code = decoded[2:-2]
+                supported = self.model_cls.supported_languages
+                if supported and lang_code in supported:
+                    logger.info("Auto-detected language: '%s'", lang_code)
+                    return lang_code
+                logger.warning(
+                    "Detected language token '%s' not in supported "
+                    "languages, defaulting to 'en'", decoded)
+                return "en"
+
+            logger.warning("Unexpected language token format '%s', "
+                           "defaulting to 'en'", decoded)
+            return "en"
+        except Exception:
+            logger.exception("Language detection failed, defaulting to 'en'")
+            return "en"
+
     async def _preprocess_speech_to_text(
         self,
         request: SpeechToTextRequest,
@@ -285,6 +353,11 @@ class OpenAISpeechToText(OpenAIServing):
             and duration > self.asr_config.max_audio_clip_s
         )
         chunks = [y] if not do_split_audio else self._split_audio(y, int(sr))
+
+        if language is None:
+            language = await self._detect_language(chunks[0])
+            request.language = language
+            
         prompts = []
         for chunk in chunks:
             # The model has control over the construction, as long as it
